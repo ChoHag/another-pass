@@ -1,0 +1,922 @@
+#!/bin/bash
+
+# Abort if any failure is not trapped
+set -e
+
+########## Folding, and reading this source code.
+
+# There are folding markers throughout this file so that if it is opened in vim
+# you should see a few lines of mostly comments. If using the default settings,
+# the code within a fold can be seen be navigating to it and typing 'zo'. 'zc'
+# will close it again and 'za' toggles between opened and closed.
+
+# Enable debugging if the debug environment variable is set to anything
+# other than null or zero.
+if [[ -v debug && $debug && $debug != 0 ]]; then
+  debug=1
+  set -x
+else
+  unset debug
+fi
+
+########## Password handling functions.
+
+#{{{
+
+# Generate a new password into the password variable
+generate_password() {
+  password=$(pwgen -s ${symbols:+-y} $length 1)
+}
+
+# set passdir
+# fail unless $1 = --init
+find_passdir() {
+  unset passdir
+  if [[ -v PASSWORD_STORE_DIR ]]; then
+    passdir=$PASSWORD_STORE_DIR
+  else
+    if [[ -e $HOME/.password-store ]]; then
+      passdir=$HOME/.password-store
+    else
+      if [[ -e $PWD/.password-store-here ]]; then
+	passdir=$PWD
+      fi
+    fi
+  fi
+
+  # Everything's fine in init mode.
+  if [[ $1 == --init ]]; then return; fi
+
+  # Complain & fail
+  if [[ ! -v passdir ]]; then
+    echo Password directory not found. >&2
+    return 1
+  fi
+
+  if [[ ! -e "$passdir"/.git && ! ( -v force || -v skip_git ) ]]; then
+    echo Password directory is not a git repository. >&2
+    return 1
+  fi
+}
+
+# Determine who the file being created should be encrypted to.
+# Starting from $passdir, and with recipients empty, step through each folder
+# in the password's directory hierarchy.
+#
+# In each folder:
+#  If the file .keyids-reset exists, clear the recipients variable.
+#  If the file .keyids exists, it is parsed line-by-line:
+#  *Blank lines, whitespace, and lines beginning with # are ignored.
+#  *If the line is of the form "word: key", then the key is only added to
+#   recipients if word (which might one day be a glob or regex) matches the
+#   password (in $passname).
+#  *Any other lines are added to recipients as they are.
+#
+# This does _NOT_ append the current user to the list of recipients.
+#
+read_recipients() {
+  unset recipients
+  oIFS=$IFS
+  IFS=/
+  dirs=(${passname%/*})
+  IFS=$oIFS
+  unset append
+  for dir in '' "${dirs[@]}"; do
+    if [[ -e $passdir/$append/$dir/.keyids-reset ]]; then
+      unset recipients
+    fi
+    if [[ -e $passdir/$append/$dir/.keyids ]]; then
+      while read line; do
+	if [[ $line =~ ^[$' \t']*(#.*)?$ ]]; then
+	  continue
+	fi
+	if [[ $line =~ ^[$' \t']*([^$' \t']):[$' \t']+ ]]; then
+	  match=${BASH_REMATCH[1]}
+	  key=${line#${BASH_REMATCH[0]}}
+	else
+	  unset match
+	  key=$line
+	fi
+	if [[ -v match || $match = ${passname##*/} ]]; then
+	  recipients=("${recipients[@]}" "$key")
+	fi
+      done
+    fi
+  done
+}
+
+# Check all args for existence of file.{gpg,asc} or, if $1 = --tree, file/
+check_missing() {
+  if [[ "$1" == "--tree" ]]; then
+    dirok=1
+    shift
+  else
+    unset dirok
+  fi
+
+  # Append missing files (and directories) to missing.
+  unset missing
+  for passname in "$@"; do
+    if ! [[ -e "$passdir/$passname.gpg" || -e "$passdir/$passname.asc" ]]; then
+      if ! [[ -v dirok && -e "$passdir/$passname" ]]; then
+	missing=("${missing[@]}" "$passname")
+      fi
+    fi
+  done
+
+  # Complain & fail
+  if [[ ${#missing[@]} != 0 ]]; then
+    for m in "${missing[@]}"; do
+      echo Password not found: "$m" >&2
+    done
+    return 1
+  fi
+}
+
+# Check all arguments for existing file.{gpg,asc} or non-existing parent
+# directories, make directory if $1 == --mkdir
+check_absent() {
+  if [[ "$1" == "--mkdir" ]]; then
+    mkdir=1
+    shift
+  else
+    unset mkdir
+  fi
+
+  # Append to missingdir or exists if the passname is missing its parent
+  # directories or a file exists.
+  unset missingdir exists
+  for passname in "$@"; do
+    if [[ $passname =~ / ]]; then
+      if [[ ! -d "$passdir/${passname%/*}" ]]; then
+	missingdir=("${missingdir[@]}" "$passname")
+      fi
+    fi
+    if [[ -e "$passdir/$passname.gpg" || -e "$passdir/$passname.asc" ]]; then
+      exists=("${exists[@]}" "$passname")
+    fi
+  done
+
+  # Complain about missing directories or make them.
+  if [[ ${#missingdir[@]} != 0 ]]; then
+    for m in "${missingdir[@]}"; do
+      if [[ -v mkdir ]]; then
+	echo Creating new password folder for "$m".
+	mkdir -p "$passdir/${passname%/*}"
+      else
+	echo Password folder not found for: "$m". >&2
+      fi
+    done
+  fi
+
+  # Complain about missing files.
+  if [[ ${#exists[@]} != 0 ]]; then
+    for m in "${exists[@]}"; do
+      echo Password already exists: "$m" >&2
+    done
+  fi
+
+  # Fail unless directories were made.
+  if [[ ( ${#missingdir[@]} != 0 && ! -v mkdir ) || ${#exists[@]} != 0 ]]; then
+    return 1
+  fi
+}
+
+# Set passfile to the full path of the encrypted password data.
+# If there are too many files, unset passfile and set passdata to CONFUSED.
+# If there are no files, unset passfile and set passdata to MISSING.
+# Fail unless $1 = --oknoexist
+locate_passfile() {
+  if [[ "$1" == "--oknoexist" ]]; then
+    fail=soft
+    shift
+  else
+    fail=hard
+  fi
+
+  # Check for multiple files
+  unset passfile
+  if [[ -e "$passdir/$1.gpg" && -e "$passdir/$1.asc" ]]; then
+    echo .gpg and .asc file found. Confused. >&2
+    audit locate-confused "$1"
+    passdata=CONFUSED
+    return 1
+  fi
+
+  # Locate the actual file
+  if [[ -e "$passdir/$1.gpg" ]]; then
+    passfile=$passdir/$1.gpg
+    unset passdata
+  elif [[ -e "$passdir/$1.asc" ]]; then
+    passfile=$passdir/$1.asc
+    unset passdata
+  else
+    passdata=MISSING
+
+    # Complain & fail
+    if [[ $fail != hard ]]; then
+      echo Password "$1" not found. >&2
+      return 1
+    fi
+  fi
+}
+
+# Locate the password file with locate_passfile and decrypt its contents to the
+# passdata variable.
+# If $1 = --oknoexist and the file doesn't exist, passfile and passdata will be
+# propagated from locate_passfile (null and 'MISSING' respectively).
+read_passfile() {
+  if [[ "$1" == "--oknoexist" ]]; then
+    ok=$1
+  else
+    unset ok
+  fi
+
+  locate_passfile $ok "$1"
+
+  # Complain if the file is not readable
+  if [[ -d "$passfile" || ( "$passdata" == MISSING && ! -v ok ) || ! -v passfile ]]; then
+    echo "$1" is unreadable or is a directory. >&2
+    audit unreadable "$1"
+    if [[ ! -v passdata ]]; then
+      passdata=UNREADABLE
+    fi
+    return 1
+  fi
+
+  # Decrypt into passdata
+  audit read "$1"
+  passdata=$(call_gpg -d "$passfile")$'\n'
+}
+
+save_passfile() {
+  read_recipients
+  unset gpg_args
+  for r in "${recipients[@]}" "${dest[@]}"; do
+    gpg_args=("${gpg_args[@]}" -r "$r")
+  done
+  echo -n "$passdata" | call_gpg -e "${gpg_args[@]}" -o "$passfile"
+  rc_add_file "$passfile"
+}
+
+sign_passfile() {
+  if [[ -v key ]]; then
+    key=$(call_gpg --list-secret-keys --with-colons | head -n1 | cut -d: -f5)
+    if [[ -z "$key" ]]; then
+      echo No signing key. >&2
+      return 1
+    fi
+  fi
+
+  call_gpg --detach-sign "$passfile" -o "$passfile".sig."$key"
+  rc_add_file "$passfile".sig."$key"
+  audit sign "$passfile"
+}
+
+#}}}
+
+########## 'Exposed' functions.
+
+#{{{
+
+# Create the directory $1 if it doesn't exist and run git init unless
+# --skip-git is set.
+init_store() {
+  if [[ $# == 0 ]]; then
+    ## Try and find the default passdir
+    find_passdir --init
+    if [[ ! -v passdir ]]; then
+      echo "Don't" know where to create password store. >&2
+      return 1
+    fi
+  else
+    passdir=$1
+    if [[ -e "$passdir" ]]; then
+      echo "$passdir" already exists. >&2
+      if [[ ! -v force ]]; then
+	return 1
+      fi
+      echo Continuing because --force. >&2
+    fi
+  fi
+
+  mkdir ${force:+-p} "$passdir"
+
+  if [[ ! -v skip_git ]]; then
+    if [[ -e "$passdir"/.git ]]; then
+      echo "$passdir" is already a git repository.
+      if [[ ! -v force ]]; then
+	return 1
+      fi
+      echo Continuing because --force. >&2
+    fi
+  fi
+
+  rc_init
+}
+
+# Decrypt each password file to stdout.
+# Will only display the first line (ie. the password) if $1 = -1.
+# Will copy to the clipboard if --clip is set.
+# Will surround each password with a header and footer if --headings is set.
+get_password() {
+  find_passdir
+
+  wholefile=1
+  if [[ $1 = "-1" ]]; then
+    unset wholefile
+    shift
+  fi
+
+  if ! check_missing "$@"; then
+    if [[ ! -v force ]]; then
+      return 1
+    fi
+  fi
+
+  for passname in "$@"; do
+    read_passfile "$passname"
+
+    if [[ -v headings ]]; then
+      echo -n "$passname: "
+    fi
+
+    # Print the password
+    echo ${passdata%%$'\n'*}
+    if [[ -v clip ]]; then
+      : # TODO: clipboard
+    fi
+
+    # Print the rest
+    if [[ -v wholefile && -n "${passdata#*$'\n'}" ]]; then
+      echo -n "${passdata#*$'\n'}"
+    fi
+
+    if [[ -v wholefile && -v headings ]]; then
+      echo ---
+    fi
+  done
+}
+
+# List each password file or directory under each password.
+# Will surround each password with a header and footer if --headings is set.
+list_password_tree() {
+  find_passdir
+
+  if [[ "$*" != . ]] && ! check_missing "$@"; then
+    if [[ ! -v force ]]; then
+      return 1
+    fi
+  fi
+
+  for passname in "$@"; do
+    if [[ -v headings ]]; then
+      if [[ $passname = . ]]; then
+	echo STORE:
+      else
+	echo $passname:
+      fi
+    fi
+    if [[ -e "$passdir/$passname" ]]; then
+      audit list "$passname"
+      passtree=$(tree --noreport "$passdir/$passname" | tail -n+2)
+      if [[ "$passtree" ]]; then
+	echo "$passtree"
+      else
+	echo '  <empty>'
+      fi
+    fi
+    if [[ -e "$passdir/$passname.gpg" ]]; then
+      audit list "$1".gpg
+      echo "$passname.gpg"
+    fi
+    if [[ -e "$passdir/$passname.asc" ]]; then
+      audit list "$1".asc
+      echo "$passname.asc"
+    fi
+    if [[ -v headings ]]; then
+      echo
+    fi
+
+    if [[ $commit == step ]]; then
+      commit_and_push list-tree "$passname"
+    fi
+  done
+}
+
+# Insert new passwords.
+# Uses generate_password to create a new password if $1 = --generate, otherwise
+# asks on stdin.
+# The --echo option causes passwords to be echoed to the terminal.
+# The --once option skips asking for the password a second time.
+# If --multiline is set, the entire contents of the file are read from stdin,
+# terminated with a single dot (.) or EOF, although this means further files
+# cannot be written.
+insert_password() {
+  find_passdir
+
+  if [[ $1 == "--generate" ]]; then
+    source=gen
+    shift
+  else
+    source=ask
+  fi
+
+  # Check for existing files and create missing directories
+  if ! check_absent --mkdir "$@"; then
+    if [[ ! -v force ]]; then
+      return 1
+    fi
+  fi
+
+  for passname in "$@"; do
+    # If the file exists, skip it.
+    if locate_passfile --oknoexist "$passname"; then
+      continue
+    fi
+
+    if [[ -z "$passfile" ]]; then
+      new=1
+      passfile=$passdir/$passname.gpg
+    else
+      unset new
+    fi
+
+    if [[ $source == "gen" ]]; then
+      # Use generate_password and finish with passdata set to the full file
+      # contents and password unset.
+      generate_password
+      passdata=$password$'\n'
+      unset password
+
+    else
+      if [[ -v multiline ]]; then
+	# Read stdin up to . or EOF
+	echo "Enter contents of $passname:"
+	unset passdata eof
+	while read -r ${echo:+-s} line || eof=1; do
+	  if [[ $eof == 1 || "$line" == "." ]]; then
+	    break
+	  else
+	    passdata=$passdata$line$'\n'
+	  fi
+	done
+
+      else
+	# Password reading shenanegans.
+	unset password
+	password_repeat="UNCHECKED"
+	while [[ "$password" != "$password_repeat" ]]; do
+	  read -r ${echo:--s} -p "Enter password for $passname: " password
+	  if [[ ! -v echo ]]; then echo; fi
+	  if [[ -v once ]]; then
+	    password_repeat=$password
+	  else
+	    read -r ${echo:--s} -p "Repeat password for $passname: " password_repeat
+	    if [[ ! -v echo ]]; then echo; fi
+	  fi
+	  if [[ "$password" != "$password_repeat" ]]; then
+	    echo Passwords do not match. >&2
+	  fi
+	done
+	passdata=$password$'\n'
+	unset password password_repeat
+      fi
+    fi
+
+    save_passfile
+
+    if [[ $commit == step ]]; then
+      commit_and_push insert-password $source "$passname"
+    fi
+
+    # Just give up if we don't have stdin any more.
+    if [[ -v multiline && -v eof ]]; then
+      break
+    fi
+  done
+}
+
+# Copy each password to a temporary file and edit it.
+# Create new files that don't exist if --force is set.
+edit_password() {
+  find_passdir
+
+  if ! check_missing "$@"; then
+    if [[ ! -v force ]]; then
+      return 1
+    fi
+  fi
+
+  for passname in "$@"; do
+    audit edit${new:--new} "$passname"
+
+    # Read the password data if it exists.
+    passorig=$(internal_tempfile)
+    read_passfile ${force:+--oknoexist} "$passname"
+    if [[ -z "$passfile" && -v force ]]; then
+      new=1
+      passfile=$passdir/$passname.gpg
+    else
+      unset new
+      echo -n "$passdata" >"$passorig"
+    fi
+    unset passdata
+
+    # Edit the file until satisfied.
+    if [[ "$passfile" ]]; then
+      accept=r
+      passtmp=$(internal_tempfile)
+      while [[ ${accept,} != y ]]; do
+	if [[ ${accept,} == r ]]; then
+	  cat "$passorig" >"$passtmp"
+	fi
+	${VISUAL:-${EDITOR:-vi}} "$passtmp"
+	if diff -u "$passorig" "$passtmp"; then
+	  echo '  <no change>'
+	fi
+	if ! read -r -p "Accept? [Y=yes,n=no/edit,r=restart,a=abort] " accept; then
+	  accept=a
+	fi
+	if [[ -z "$accept" ]]; then
+	  accept=y
+	fi
+	if [[ ${accept,} == a ]]; then
+	  return 1
+	fi
+      done
+      passdata=$(cat "$passtmp")
+      rm -f "$passtmp"
+      if [[ ! -v new ]]; then
+	rm -f "$passorig"
+      fi
+
+      save_passfile
+    else
+
+      audit edit-missing "$passname"
+    fi
+
+    if [[ $commit == step ]]; then
+      commit_and_push edit "$passname"
+    fi
+  done
+}
+
+# Delete the specified passwords.
+# The --force option deletes all files even if some are already missing.
+delete_password() {
+  find_passdir
+
+  if ! check_missing "$@"; then
+    if [[ ! -v force ]]; then
+      return 1
+    fi
+  fi
+
+  for passname in "$@"; do
+    locate_passfile "$passname"
+    if [[ "$passfile" ]]; then
+      audit delete "$passname"
+      rm -f "$passfile"
+      rc_rm_file "$passfile"
+    else
+      audit delete-missing "$passname"
+    fi
+
+    if [[ $commit == step ]]; then
+      commit_and_push delete "$passname"
+    fi
+  done
+}
+
+# Sign the _encrypted_ file with a detached signature.
+# If --quick-sign is not set, display the decrypted password file first and
+# await verification.
+verify_password() {
+  find_passdir
+
+  # Check for existing files and create missing directories
+  if ! check_missing "$@"; then
+    if [[ ! -v force ]]; then
+      return 1
+    fi
+  fi
+
+  for passname in "$@"; do
+    locate_passfile "$passname"
+    if [[ "$passfile" ]]; then
+      if [[ ! -v quick ]]; then
+	read_passfile "$passname"
+	echo -n "$passdata"
+	if ! read -r -p "OK? [N/y] " ok; then
+	  ok=n
+	fi
+	if [[ ${ok,} != y ]]; then
+	  if [[ -v force ]]; then
+	    continue
+	  else
+	    break
+	  fi
+	fi
+      fi
+
+      sign_passfile # includes audit
+
+    else
+      audit sign-missing "$passname"
+    fi
+
+    if [[ $commit == step ]]; then
+      commit_and_push verify "$passname"
+    fi
+  done
+}
+
+#}}}
+
+########## Other useful functions, including audit.
+
+#{{{
+
+##########
+
+audit() {
+  echo "$(date)" ${LOGNAME} "$(hostname -f)" "$@" >>"$audit_log"
+  if [[ $commit == audit ]]; then
+    commit_and_push audit
+  fi
+}
+
+rc_init() {
+  pushd "$passdir" >/dev/null 2>&1
+  git init
+  popd >/dev/null 2>&1
+}
+
+rc_add_file() {
+  if [[ ! -e "$passdir"/.git ]]; then return; fi
+  pushd "$passdir" >/dev/null 2>&1
+  git add "${@/#"$passdir/"/}"
+  popd >/dev/null 2>&1
+}
+
+rc_rm_file() {
+  if [[ ! -e "$passdir"/.git ]]; then return; fi
+  pushd "$passdir" >/dev/null 2>&1
+  git rm -f "${@/#"$passdir/"/}"
+  popd >/dev/null 2>&1
+}
+
+commit_and_push() {
+  if [[ ! -e "$passdir"/.git ]]; then return; fi
+  pushd "$passdir" >/dev/null 2>&1
+  if [[ "$(git status --porcelain)" ]]; then
+    git commit -a -m "$*"
+    if [[ -v push ]]; then
+      git push "${push_branch[@]}" ## "$[@]" expands to null if unset
+    fi
+  fi
+  popd >/dev/null 2>&1
+}
+
+unset use_unsafe_tempdir tempdir
+internal_tempfile() {
+  if [[ -v use_unsafe_tempdir \
+        || ! ( -d /dev/shm && -w /dev/shm && -x /dev/shm ) ]]; then
+    cat >&2 <<-'MESSAGE'
+	Your system does not have a usable /dev/shm, which means that it may be
+	difficult to entirely erase the temporary non-encrypted password file
+	after editing.
+MESSAGE
+    if [[ ! -v force ]]; then
+      read -r -p "Continue anyway, using global temporary directory? [y/N] " ask
+      if [[ ${ask,} != y ]]; then
+	return 1
+      fi
+    else
+      echo Continuing because --force. >&2
+      audit force-shm
+    fi
+
+    use_unsafe_tempdir=1
+    tempdir=${TMPDIR:-/tmp}
+  else
+    tempdir=/dev/shm
+  fi
+
+  mktemp "$tempdir"/tmp.XXXXXXXXXX
+}
+
+call_gpg() {
+  gpg2 --quiet --yes --batch "$@"
+}
+
+#}}}
+
+########## Command-line handling.
+
+#{{{
+
+usage() {
+  echo Don\'t panic\! >&2
+  if [[ $# -eq 1 ]]; then
+    exit $1
+  fi
+}
+
+set +e
+opt=$(getopt -q -o a:cd:efghHk:l:mnpP:rs --long audit,audit-log,clip,commit,dest:,destination:,echo,force,help,headings,length:,key:,multiline,no-symbols,push,push-dest,push-destination,recurse,recursive,skip-git,sign -- "$@")
+if [[ $? != 0 ]]; then
+  usage 1
+fi
+set -e
+eval set -- $opt
+  
+unset clip echo dest force headings key multiline push push_dest recurse skip_git sign
+audit_log=/tmp/pass.audit
+commit=step
+length=12
+symbols=1
+while true; do
+  case "$1" in
+    -a|--audit)
+      audit_log=$2
+      shift; shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -c|--clip)
+      clip=1
+      shift
+      ;;
+    --commit)
+      if [[ ${2,,} =~ ^(none|audit|step|end)$ ]]; then
+        commit=${2,,}
+      else
+        echo Invalid commit type: "${2,,}". Valid options: none, audit, step, end. >&2
+        exit 1
+      fi
+      shift; shift
+      ;;
+    -d|--dest|--destination)
+      dest=("${dest[@]}" "$2")
+      shift; shift
+      ;;
+    -e|--echo)
+      echo=1
+      shift
+      ;;
+    -f|--force)
+      force=1
+      shift
+      ;;
+    -g|--skip-git)
+      skip_git=1
+      shift
+      ;;
+    -H|--headings)
+      headings=1
+      shift
+      ;;
+    -k|--key)
+      key=$2
+      shift; shift
+      ;;
+    -l|--length)
+      length=$2
+      shift; shift
+      ;;
+    -m|--multiline)
+      multiline=1
+      shift
+      ;;
+    -n|--no-symbols)
+      unset symbols
+      shift
+      ;;
+    -p|--push)
+      push=1
+      shift
+      ;;
+    -P|--push-dest|--push-destination)
+      push_destination=$2
+      shift; shift
+      ;;
+    -r|--recurse|--recursive)
+      recurse=1
+      shift
+      ;;
+    -s|--sign)
+      sign=1
+      shift
+      ;;
+    --) shift; break ;;
+    *)  break ;;
+  esac
+done
+
+# Determine the procedure name
+
+proc=$(basename "$0")
+if [[ $proc != pass ]]; then
+  proc=${proc#pass-}
+else
+  if [[ $# -eq 0 ]]; then
+    echo No procedure was specified. >&2
+    exit 1
+  fi
+  proc=$1
+  shift
+fi
+
+if [[ -v debug ]]; then
+  set +x
+  for v in proc clip echo force headings multiline symbols recurse; do
+    eval echo $v:\$$v.
+  done
+  set -x
+fi
+
+case "$proc" in
+  init)
+    # Create a directory and run git init.
+    if [[ $# -ge 2 ]]; then
+      echo "Syntax: pass init [<directory>]" >&2
+      exit 1
+    fi
+    init_store "$1"
+    ;;
+  get)
+    # Print each password (first line of file) one at a time.
+    # Each line is preceded with '<password-name>: ' if headings are enabled.
+    if [[ $# == 0 ]]; then
+      echo "Syntax: pass get <password-name>..." >&2
+      exit 1
+    fi
+    get_password -1 "$@"
+    ;;
+  show)
+    # Display the entire password file.
+    # With headings enabled, the first line has '<password-name>: ' prepended.
+    # Each file is seperated with '---' if multiple are requested.
+    if [[ $# == 0 ]]; then
+      echo "Syntax: pass show <password-name>..." >&2
+      exit 1
+    fi
+    get_password "$@"
+    ;;
+  ls|list)
+    # List the passwords available under the location specified.
+    # With headings enabled, each tree is preceeded with '<password-name>:' and
+    # terminated with a blank line.
+    list_password_tree "${@:-.}"
+    ;;
+  insert)
+    # Insert new passwords by requesting each one on stdin.
+    if [[ $# == 0 ]]; then
+      echo "Syntax: pass insert <password-name>..." >&2
+      exit 1
+    fi
+    insert_password "$@"
+    ;;
+  edit)
+    # Edit the specified password[s] in $EDITOR
+    if [[ $# == 0 ]]; then
+      echo "Syntax: pass edit <password-name>..." >&2
+      exit 1
+    fi
+    edit_password "$@"
+    ;;
+  gen|generate)
+    # Generate a new password, optionally using the specified generator, then
+    # (overridable) get() it.
+    if [[ $# == 0 ]]; then
+      echo "Syntax: pass generate <password-name>..." >&2
+      exit 1
+    fi
+    insert_password --generate "$@"
+    ;;
+  sign|verify)
+    # Sign an encrypted signature file.
+    if [[ $# == 0 ]]; then
+      echo "Syntax: pass sign <password-name>..." >&2
+      exit 1
+    fi
+    verify_password "$@"
+    ;;
+  rm|delete)
+    # Delete the specified password[s]
+    if [[ $# == 0 ]]; then
+      echo "Syntax: pass delete <password-name>..." >&2
+      exit 1
+    fi
+    delete_password "$@"
+    ;;
+esac
+
+#}}}
+
+# vim: set ft=sh fdm=marker:
