@@ -234,12 +234,12 @@ find_passdir() {
     fi
   fi
 
+  # Everything's fine in init mode.
+  if [[ $1 == --init ]]; then return; fi
+
   if ! [[ -v passdir && -d "$passdir" && -r "$passdir" && -x "$passdir" ]]; then
     return 1
   fi
-
-  # Everything's fine in init mode.
-  if [[ $1 == --init ]]; then return; fi
 
   # Complain & fail
   if [[ ! -v passdir ]]; then
@@ -518,7 +518,7 @@ sign_passfile() {
 # find_passdir()s heuristic, and initialise git if skip_git is not set.
 #
 init_store() {
-  if [[ $# == 0 ]]; then
+  if [[ $# == 0 || -v passdir ]]; then
     ## Try and find the default passdir
     find_passdir --init
     if [[ ! -v passdir ]]; then
