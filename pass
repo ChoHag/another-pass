@@ -545,7 +545,7 @@ init_store() {
 # already lost.
 #
 # If headings are enabled, the output is ostensably more human readable, but
-# when displaying the whole file the header and footer used are JSON document
+# when displaying the whole file the header and footer used are YAML document
 # markers, so it is also more easily machine-readable too.
 #
 # Copying the password to the clipboard is unimplemented and I'm not sure what
