@@ -37,4 +37,5 @@ Features that might be a bit harder:
   * Good documentation
   * Adaptable password generation
   * Front ends
+  * Encrypted filenames/directories. If you need it, try encfs.
 

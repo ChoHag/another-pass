@@ -142,7 +142,7 @@ MESSAGE
 
 # Call GPG.
 call_gpg() {
-  gpg2 --quiet --yes --batch --no-default-recipient "$@"
+  gpg --quiet --yes --batch --no-default-recipient "$@"
 }
 
 #}}}
@@ -285,10 +285,11 @@ read_recipients() {
   IFS=$oIFS
   unset append
   for dir in '' "${dirs[@]}"; do
-    if [[ -e $passdir/$append/$dir/.keyids-reset ]]; then
+    append="$append/$dir"
+    if [[ -e $passdir/$append/.keyids-reset ]]; then
       unset recipients
     fi
-    if [[ -e $passdir/$append/$dir/.keyids ]]; then
+    if [[ -e $passdir/$append/.keyids ]]; then
       while read line; do
 	if [[ $line =~ ^[$' \t']*(#.*)?$ ]]; then
 	  continue
@@ -303,7 +304,7 @@ read_recipients() {
 	if [[ ${passname##*/} = $match ]]; then # Treats $match as a glob
 	  recipients=("${recipients[@]}" "$new_key")
 	fi
-      done < $passdir/$append/$dir/.keyids
+      done < $passdir/$append/.keyids
     fi
   done
 }
@@ -456,12 +457,13 @@ read_passfile() {
 # Does *NOT* clear passdata.
 #
 save_passfile() {
-  read_recipients "$1"
+  local passname=$1
+  read_recipients "$passname"
   unset gpg_args
   for r in "${recipients[@]}" "${dest[@]}"; do
     gpg_args=("${gpg_args[@]}" -r "$r")
   done
-  audit save "$1" to "${recipients[@]}" "${dest[@]}"
+  audit save "$passname" to "${recipients[@]}" "${dest[@]}"
   echo -n "$passdata" | call_gpg -e "${gpg_args[@]}" -o "$passfile"
   rc_add_file "$passfile"
 }
@@ -792,7 +794,7 @@ insert_password() {
       write_password
     fi
 
-    save_passfile
+    save_passfile "$passname"
 
     # Lose unencrypted data ASAP
     unset passdata
@@ -880,7 +882,7 @@ edit_password() {
       rm -f "$passorig"
     fi
 
-    save_passfile
+    save_passfile "$passname"
 
     if [[ $commit == step ]]; then
       commit_and_push edit "$passname"
