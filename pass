@@ -168,6 +168,26 @@ generate_password() {
   password=$(pwgen -s ${symbols:+-y} $length 1)
 }
 
+# Write the password in $passdata to stdout. With headings if $headings is set.
+# Prints the rest of the file also if $1 is --full
+write_password() {
+  if [[ -v headings ]]; then
+    echo -n "$passname: "
+  fi
+
+  if [[ -z "$passdata" ]]; then
+    passdata=MISSING
+  fi
+
+  # Print the password
+  echo ${passdata%%$'\n'*}
+
+  # Print the rest
+  if [[ $1 == --full && -n "${passdata#*$'\n'}" ]]; then
+    echo -n "${passdata#*$'\n'}"
+  fi
+}
+
 # find_passdir()
 #   args:
 #     --init  Indicate that pass is initialising (a missing or broken password
@@ -308,9 +328,15 @@ scan_passdir() {
   unset absent
   unset present
   unset parent
+  unset also_dir
 
-  if [[ $1 =~ ^--(absent|present|parent) ]]; then
-    which=$1
+  if [[ $1 =~ ^--(absent|present|parent|dir) ]]; then
+    if [[ ${BASH_REMATCH[1]} == dir ]]; then
+      which=absent
+      also_dir=1
+    else
+      which=$1
+    fi
     shift
   else
     which=absent
@@ -322,7 +348,8 @@ scan_passdir() {
     else
       unset pass_parent
     fi
-    if [[ -e "$passdir/$passname.gpg" || -e "$passdir/$passname.asc" ]]; then
+    if [[ -e "$passdir/$passname.gpg" || -e "$passdir/$passname.asc" \
+          || ( -v also_dir && -e "$passdir/$pass_parent" ) ]]; then
       present+=("$passname")
     else
       absent+=("$passname")
@@ -541,7 +568,7 @@ init_store() {
 # Decrypt each password file named and display it to stdout. If the first
 # argument is -1, display only the first line, which should contain just the
 # password. If the password file is not present and force is enabled,
-# '<MISSING>' is written out instead. If that's also your password then you've
+# 'MISSING' is written out instead. If that's also your password then you've
 # already lost.
 #
 # If headings are enabled, the output is ostensably more human readable, but
@@ -568,23 +595,12 @@ get_password() {
   fi
 
   for passname in "$@"; do
-    if [[ -v headings ]]; then
-      echo -n "$passname: "
-    fi
+    read_passfile "$passname" || true
 
-    if ! read_passfile "$passname"; then
-      echo '<MISSING>'
-    else
-      # Print the password
-      echo ${passdata%%$'\n'*}
-      if [[ -v clip ]]; then
-	: # TODO: clipboard
-      fi
+    write_password ${wholefile:+--full}
 
-      # Print the rest
-      if [[ -v wholefile && -n "${passdata#*$'\n'}" ]]; then
-	echo -n "${passdata#*$'\n'}"
-      fi
+    if [[ -v clip ]]; then
+      : # TODO: clipboard
     fi
 
     # Lose unencrypted data ASAP
@@ -617,7 +633,7 @@ list_password_tree() {
   find_passdir
 
   #####
-  if [[ "$*" != . ]] && ! check_missing "$@"; then
+  if [[ "$*" != . ]] && ! scan_passdir --dir "$@"; then
     if [[ ! -v force ]]; then
       audit list-fail "$@"
       echo "Password[s] or directories not found:" "${missing[@]}" "${parent[@]}"
@@ -770,6 +786,10 @@ insert_password() {
 	passdata=$password$'\n'
 	unset password password_repeat
       fi
+    fi
+
+    if [[ $source == gen && -v echo ]]; then
+      write_password
     fi
 
     save_passfile
