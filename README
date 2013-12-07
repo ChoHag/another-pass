@@ -1,27 +1,40 @@
-TODO:
+This is a total rip off of Jason Donenfeld's password manager at
+http://zx2c4.com/projects/password-store/. It uses the same ideas in basically
+the same way. In fact the only reason this isn't pass version n+1 is that I
+started writing a few extra features, then wrote a few more bits, then found
+that I already had a mostly complete piece of software, so I finished it.
 
-TEST!
-Including:
-  Environment
-  Temp files
-  Audit trail
+Another Pass is a unix password manager with the following features:
+  * No documentation
+  * All encryption and decryption is performed by GPG
+    * Unsafe temporary storage is not used for unencrypted data without user
+      confirmation
+    * GPG gets/has to deal with requesting and retaining all secret data
+  * Optional revision control with git
+  * Unix tool in the traditional manner:
+    * Data stored in plain files
+    * Structure provided by filesystem directories
+    * Designed for pipelines
+    * Does one thing
+    * Does it well
+    * Output formatting for humans, machines and hybrids
+  * Multiple encryption destinations per store, directory and/or password
+  * Encrypted files can be signed
+    * NB. Verification is not performed in any guise
+  * Password generation
+  * Audit trail
+  * Simple, extensible API
+  * Deal with multiple passwords simultaneously
 
-Usage/Help
-Test & clean getopts etc.
+Features it will soon have because they're not that hard:
+  * Some documentation
+  * Copy to clipboard
+  * Better portability
+  * Ascii armoured files
+  * Separate API & CLI
 
-Clipboard
-
-What to do if no recipients or dest? Currently falls back to gpg2's default.
-
-Config file?
-
-Portability
-
-Retry crypt? Can encrypt also fail?
-
-rm tmpfile on trap
-
-password generators
-
-templates in insert/gen mode
+Features that might be a bit harder:
+  * Good documentation
+  * Adaptable password generation
+  * Front ends
 

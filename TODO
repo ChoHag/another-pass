@@ -1,0 +1,23 @@
+TEST!
+Including:
+  Environment
+  Temp files
+  Audit trail
+
+Usage/Help
+Test & clean getopts etc.
+
+Clipboard
+
+What to do if no recipients or dest?
+
+Config file?
+
+Portability
+
+Retry crypt? Can encrypt also fail?
+
+password generators
+
+templates in insert/gen mode
+
