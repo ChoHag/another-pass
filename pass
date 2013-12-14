@@ -45,7 +45,7 @@ unset push push_dest
 unset use_unsafe_tempdir tempdir
 unset all_temp_files
 tempfile_counter=0
-trap 'eval /bin/rm -f $all_temp_files' INT TERM ERR EXIT
+trap 'if [[ -n "$all_temp_files" ]]; then eval /bin/rm -f $all_temp_files; fi' INT TERM ERR EXIT
 
 #}}}
 
