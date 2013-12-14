@@ -34,6 +34,7 @@ unset clip echo multiline once headings
 # Password
 unset absent present parent
 unset passdir passname passfile password passdata
+unset footer
 length=12
 symbols=1
 # Keys
@@ -790,6 +791,10 @@ insert_password() {
       fi
     fi
 
+    if [[ -v footer ]]; then
+      passdata=$passdata$footer
+    fi
+
     if [[ $source == gen && -v echo ]]; then
       write_password
     fi
@@ -1063,11 +1068,11 @@ USAGE
 }
 
 set +e
-short_opt="a:cd:efgHhk:l:mnpP:Qs:"
+short_opt="a:cd:eF:fgHhk:l:mnpP:Qs:"
 long_opt=(
-  audit: clip commit dest: destination: echo force skip-git headings help key:
-  length: multiline no-symbols push push-dest: push-destination: quick-sign
-  dir: store-directory:
+  audit: clip commit dest: destination: echo footer force skip-git headings
+  help key: length: multiline no-symbols push push-dest: push-destination:
+  quick-sign dir: store-directory:
 )
 opt=$(getopt -q -o "$short_opt" "${long_opt[@]/#/--long=}" -- "$@")
 if [[ $? != 0 ]]; then
@@ -1106,6 +1111,14 @@ while true; do
     -e|--echo)
       echo=1
       shift
+      ;;
+    -F|--footer)
+      if [[ $2 =~ ^file: ]]; then
+	footer="$(cat "${2:5}")"
+      else
+	footer="$(printf "$2")"
+      fi
+      shift; shift
       ;;
     -f|--force)
       force=1
