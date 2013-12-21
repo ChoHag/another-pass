@@ -1,5 +1,8 @@
 #!/bin/bash
 
+NAME=another-pass
+VERSION=1
+
 ########## Folding, and reading this source code.
 
 # There are folding markers throughout this file so that if it is opened in vim
@@ -1257,6 +1260,11 @@ case "$proc" in
       exit 1
     fi
     delete_password "$@"
+    ;;
+  version|about|license)
+    echo $NAME version $VERSION.
+    echo Copyright 2013 Matthew King '<matthew.king@monnsta.net>'
+    echo Released under the WTFPL version 2 or, at your option, any other license.
     ;;
 esac
 
