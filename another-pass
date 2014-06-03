@@ -1,0 +1,791 @@
+#!/bin/bash
+
+NAME=another-pass
+VERSION=2-alpha
+
+#### Folding, and reading this source code.
+
+# There are folding markers throughout this file so that if it is opened in vim
+# you should see a few lines of mostly comments. If using the default settings,
+# the code within a fold can be seen be navigating to it and typing 'zo'. 'zc'
+# will close it again and 'za' toggles between opened and closed.
+
+# {{{ Initialisation
+
+# Define the help function. Put it first so that the code starts with its documentation.
+usage() { #{{{
+  echo "There is no documentation"
+  if [[ $# -eq 1 ]]; then
+    exit $1
+  fi
+} #}}}
+
+# Enable debugging if the debug environment variable is set to anything
+# other than null or zero.
+if [[ -v debug && $debug && $debug != 0 ]]; then
+  debug=1
+  set -x
+else
+  unset debug
+fi
+
+# Abort if any command returns an error
+set -e
+
+# Create files readable only by the current user.
+umask 0077
+
+# Clear/set global variables
+unset proc
+unset arguments
+unset echo_tty edit_create diff headings key multiline overwrite
+unset read_once recursive reset_keyids skip_git storedir
+unset tempdir tempfiles use_unsafe_tempdir
+default_recipients=(--default-recipient-self)
+generate_symbols=1
+generate_length=12
+
+# Tell gpg-agent which tty to use when used in a pipeline
+export GPG_TTY="$(tty)" 
+
+# }}}
+
+# Define functions... {{{
+
+## another_pass_* procedures {{{
+
+another_pass_init() { #{{{
+  # if storedir is not set, and there is one argument, set storedir to it.
+  # Otherwise, any arguments is an error.
+  if [[ ! -v storedir ]] && [[ $# -eq 1 ]]; then
+    storedir=$1
+  elif [[ $# -ne 0 ]]; then
+    echo "No arguments to init" >&2
+    return 2
+  fi
+  if storedir_find; then
+    echo "Store directory already exists." >&2
+    return 1
+  else
+    if [[ $? == 2 ]]; then
+      mkdir -p "$storedir"
+      if [[ ! -v skip_git ]]; then
+	rc_init "$storedir"
+      fi
+    else
+      echo "Cannot initialise store directory: $storedir." >&2
+      return 3
+    fi
+  fi
+} #}}}
+
+another_pass_ls() { #{{{
+  if ! storedir_find --complain; then
+    return 1
+  fi
+
+  if [[ $# -eq 0 ]]; then
+    ls ${recursive:+-R} "$storedir"
+  else
+    for P; do
+      echo "$P:"
+      ls ${recursive:+-R} "$storedir"/"$P"
+    done
+  fi
+} #}}}
+
+another_pass_tree() { #{{{
+  if [[ $# -eq 0 ]]; then
+    echo "No password given." >&2
+    return 1
+  fi
+  storedir_find
+  for P; do
+    echo "$P:"
+    tree --noreport "$storedir/$passname" | tail -n+2
+  done
+} #}}}
+
+another_pass_get() { #{{{
+  if ! storedir_find --complain; then
+    return 1
+  fi
+
+  for P in "${@:-password}"; do
+    if [[ -v headings && $# -gt 1 ]]; then echo -n "$P: "; fi
+    passfile_read "$P" | head -n1
+  done
+} #}}}
+
+another_pass_show() { #{{{
+  if ! storedir_find --complain; then
+    return 1
+  fi
+
+  for P in "${@:-password}"; do
+    if [[ -v headings && $# -gt 1 ]]; then echo -n "$P: "; fi
+    passfile_read "$P"
+    if [[ -v headings && $# -gt 1 ]]; then echo "---"; fi
+  done
+} #}}}
+
+another_pass_rewrite() { #{{{
+  if ! storedir_find --complain; then
+    return 1
+  fi
+
+  for P in "${@:-.}"; do
+    if [[ -d "$storedir/$P" ]]; then
+      passdir_rewrite "$P"
+    else
+      passfile_rewrite "$P"
+    fi
+  done
+
+  rc_commit "Rewrite ${*:-all}"
+} #}}}
+
+another_pass_insert() { #{{{
+  if ! storedir_find --complain; then
+    return 1
+  fi
+
+  for P in "${@:-password}"; do
+    password_read "$P" # calls passfile_write
+  done
+
+  rc_commit "Insert ${*:-default password}"
+} #}}}
+
+another_pass_generate() { #{{{
+  if ! storedir_find --complain; then
+    return 1
+  fi
+
+  for P in "${@:-password}"; do
+    if [[ -v headings && $# -gt 1 ]]; then echo -n "$P: "; fi
+    password_generate "$P" | passfile_write ${overwrite:+--replace} "$P"
+    if [[ -v headings && $# -gt 1 ]]; then echo "---"; fi
+  done
+
+  rc_commit "Generate ${*:-default password}"
+} #}}}
+
+another_pass_edit() { #{{{
+  if ! storedir_find --complain; then
+    return 1
+  fi
+
+  for P in "${@:-password}"; do
+    passfile_edit "$P"
+  done
+
+  rc_commit "Edit ${*:-default password}"
+} #}}}
+
+another_pass_addkey() { #{{{
+  if ! storedir_find --complain; then
+    return 1
+  fi
+
+  if [[ -v reset_keyids ]]; then
+    verb="Reset"
+  else
+    verb="Appended to"
+  fi
+
+  if [[ $# -eq 0 ]]; then
+    which="top-level"
+    passdir_addkey ""
+  else
+    which="$@"
+    for P; do
+      passdir_addkey "$P"
+    done
+  fi
+
+  if [[ -v multiline ]]; then
+    rc_commit "$verb $which"
+  else
+    rc_commit "$verb $which: $key"
+  fi
+} #}}}
+
+## }}}
+
+## Locate the password store {{{
+
+storedir_find() { #{{{
+  if [[ ! -v storedir ]]; then
+    if [[ -v PASSWORD_STORE_DIR ]]; then
+      storedir=$PASSWORD_STORE_DIR
+    else
+      if [[ -e $HOME/.password-store ]] && ! [[ -d $HOME/.password-store ]]; then
+	storedir=$(grep -Ev '^[[:space:]]*(#.*)?$' $HOME/.password-store)
+      else
+	storedir=$HOME/.password-store
+      fi
+    fi
+  fi
+
+  if ! [[ -d "$storedir" && -r "$storedir" && -x "$storedir" ]]; then
+    if [[ $# -ne 0 && $1 == "--complain" ]]; then
+      echo "Password store not found: $storedir" >&2
+    fi
+    return 2
+  fi
+
+  if [[ ! -e "$storedir/.git" && ! -v skip_git ]]; then
+    if [[ $# -ne 0 && $1 == "--complain" ]]; then
+      echo "Password store is not a git repository: $storedir" >&2
+    fi
+    return 3
+  fi
+} #}}}
+
+## }}}
+
+## Basic file read/write {{{
+
+passfile_find() { #{{{
+  if storedir_find --complain; then
+    storedir_missing=0
+  else
+    storedir_missing=$?
+  fi
+
+  if [[ $# -eq 0 ]]; then
+    unset passfile
+    return 4
+  fi
+
+  # Find the correct name
+  if [[ $1 =~ \.(gpg|asc)$ ]]; then
+    passfile=$1
+  else
+    if [[ $storedir_missing -ne 2 \
+	&& -e "$storedir/$1.asc" && -e "$storedir/$1.gpg" ]]; then
+      echo "WARNING: Password $1 has asc and gpg file." >&2
+      passfile="$1.gpg"
+      return 2
+    fi
+    if [[ $storedir_missing -ne 2 && -e "$storedir/$1".asc ]]; then
+      passfile="$1.asc"
+    else
+      passfile="$1.gpg"
+    fi
+  fi
+
+  if [[ $storedir_missing -ne 0 ]]; then
+    return 3
+  fi
+
+  # Test whether the file exists (for the caller)
+  test -e "$storedir/$passfile"
+} #}}}
+
+passfile_read() { #{{{
+  if [[ $# != 1 ]]; then return 2; fi
+  if passfile_find "$1"; then :; else # sets $passfile
+    if [[ $? != 2 ]]; then # gpg & asc warning
+      echo "Password not found: $1" >&2
+      return 1
+    fi
+  fi
+  <"$storedir/$passfile" call_gpg --decrypt
+} #}}}
+
+passfile_write() { #{{{
+  if [[ ! -v storedir ]]; then return 3; fi
+  if [[ $# -eq 0 || ( $# -eq 1 && $1 == --replace ) ]]; then
+    echo No password to passfile_write. >&2
+    return 2
+  fi
+  fail() {
+    if [[ $? -ne 1 ]]; then
+      echo "Cannot find passfile for $1 in $storedir." >&2
+      return 2
+    fi
+  }
+  if [[ $1 == --replace ]]; then
+    shift
+    if passfile_find "$1"; then :; else
+      fail
+    fi
+  else
+    if passfile_find "$1"; then # sets $passfile
+      echo "Password already exists: $1" >&2
+      return 1
+    else
+      fail
+    fi
+  fi
+  recipients_find "$passfile"
+  mkdir -p "$(dirname "$storedir/$passfile")" ### ADD TO UNIT TEST
+  if [[ -v echo_tty ]]; then
+    ## multiplex to gpg & tty
+    tee >(call_gpg --encrypt "${recipients[@]}" >"$storedir/$passfile.tmp")
+  else
+    call_gpg --encrypt "${recipients[@]}" >"$storedir/$passfile.tmp"
+  fi
+  mv -f "$storedir/$passfile.tmp" "$storedir/$passfile"
+  rc_add "$passfile"
+} #}}}
+
+passfile_edit() { #{{{
+  local passname=$1
+  # Read the password data if it exists.
+  call_mktemp passtmp
+  if ! passfile_find "$passname"; then
+    if [[ ! -v edit_create ]]; then
+      echo "Password does not exist: $passname" >&2
+      return 1
+    fi
+    unset replacing
+  else
+    passfile_read "$passname" >"$passtmp"
+    replacing=1
+  fi
+
+  if [[ -v diff ]]; then
+    call_mktemp passorig
+    unset accept
+    while [[ ${accept,} != y ]]; do
+      if [[ ${accept,} == r ]]; then
+	cat "$passorig" >"$passtmp"
+      fi
+      call_editor "$passtmp"
+      if call_diff "$passorig" "$passtmp"; then
+	echo '  <no change>'
+      fi
+      if ! read -r -p "Accept? [Y=yes,n=no/edit,r=restart,a=abort] " accept; then
+	accept=a
+      elif [[ -z "$accept" ]]; then
+	accept=y
+      fi
+      if [[ ${accept,} == a ]]; then
+	return 1
+      fi
+    done
+    call_destroy "$passorig"
+  else
+    call_editor "$passtmp"
+  fi
+
+  <"$passtmp" passfile_write ${replacing:+--replace} "$passname"
+  call_destroy "$passtmp"
+  rc_add "$passname"
+} #}}}
+
+## }}}
+
+## Read (from the tty/stdin) or generate a password {{{
+
+password_read() { #{{{
+  if [[ -v multiline ]]; then
+    if [[ -v delimeter ]]; then
+      password_read_delimeted "$1" | passfile_write ${overwrite:+--replace} "$1"
+    else
+      if [[ -v echo_tty ]]; then
+	echo "Enter contents of $1, terminated with EOF (ctrl-d):"
+      fi
+      passfile_write ${overwrite:+--replace} "$1"
+    fi
+  else
+    password_read_single "$1" | passfile_write ${overwrite:+--replace} "$1"
+  fi
+} #}}}
+
+password_read_single() { #{{{
+  prompt_one="Enter password for $1: "
+  prompt_two="Repeat password for $1: "
+  read_line="read -r"
+  if [[ ! -v echo_tty ]]; then
+    read_line="$read_line -s"
+    # doesn't disturb stderr if stdin is a pipe
+    echo_new_line="if tty >/dev/null; then echo >&2; fi"
+  else
+    echo_new_line=""
+  fi
+  if [[ -v read_once ]]; then
+    PROMPT=$prompt_one bash -c "
+      $read_line -p \"\$PROMPT\" password; $echo_new_line
+      echo \"\$password\";
+    "
+  else
+    PROMPT=$prompt_one AGAIN=$prompt_two bash -c "
+      password=1 password_repeat=2;
+      while [[ \$password != \$password_repeat ]]; do
+	$read_line -p \"\$PROMPT\" password;       $echo_new_line
+	$read_line -p \"\$AGAIN\" password_repeat; $echo_new_line
+	if [[ \"\$password\" != \"\$password_repeat\" ]]; then
+	  echo \"Passwords do not match.\" >&2;
+	else
+	  echo \"\$password\";
+	fi;
+      done
+    "
+  fi
+} #}}}
+
+password_read_delimeted() { #{{{
+  if [[ -v echo_tty ]]; then
+    echo "Enter contents of $1, terminated by \"$delimeter\":"
+  fi
+  bash -c "
+    while read -r line; do
+      if [[ \$line == '$delimeter' ]]; then
+	break;
+      else
+	echo \"\$line\";
+      fi;
+    done"
+} #}}}
+
+password_generate() { #{{{
+  pwgen -s ${generate_symbols:+-y} $generate_length 1
+} #}}}
+
+## }}}
+
+## Recursive re-encrypting {{{
+
+passfile_rewrite() { #{{{
+  passfile_read "$1" | passfile_write --replace "$1"
+} #}}}
+
+passdir_rewrite() { #{{{
+  if storedir_find --complain; then :; else
+    return $?
+  fi
+
+  pushd "$storedir/$1" >/dev/null
+  local file
+  for file in *; do
+    if [[ -d "$file" ]]; then
+      passdir_rewrite "$1/$file"
+    elif ! [[ $file =~ \.(gpg|asc)$ ]]; then
+      continue
+    else
+      passfile_rewrite "$1/$file"
+    fi
+  done
+  popd >/dev/null
+} #}}}
+
+## }}}
+
+## Key handling {{{
+
+passdir_addkey() { #{{{
+  local passdir=$1
+
+  if [[ ! -v key && ! -v multiline ]]; then
+    echo "No new key specified." >&2
+    return 1
+  fi
+
+  if storedir_find --complain; then :; else
+    return $?
+  fi
+
+  if [[ ! -d "$storedir/$passdir" ]]; then
+    mkdir -p "$storedir/$passdir"
+  fi
+
+  if [[ -e "$storedir/$passdir/.keyids" && -v reset_keyids ]]; then
+    rm -f "$storedir/$passdir/.keyids"
+  fi
+
+  if [[ -v multiline ]]; then
+    echo "Additional key IDs for $passdir:"
+    cat >> "$storedir/$passdir/.keyids"
+  else
+    echo "$key" >> "$storedir/$passdir/.keyids"
+  fi
+
+  rc_add "$passdir/.keyids"
+} #}}}
+
+# }}}
+
+## Build a list of recipients {{{
+
+recipients_find() { #{{{
+  if [[ ! -v storedir ]]; then return 2; fi
+
+  # Use bash word splitting to seperate the passfile into directory components
+  passname="${1#/}"
+  oIFS=$IFS
+  IFS=/
+  dirs=(${passname%/*})
+  IFS=$oIFS
+
+  # Clear the recipients list prior to scanning
+  recipients_reset
+
+  if [[ ! $passname =~ / ]]; then
+    return 0
+  fi
+
+  # Iterate over each component in the passfile's path
+  unset path
+  for dir in "${dirs[@]}"; do
+    path="$path/$dir"
+
+    # If there is a .keyids-reset file, clear the current list of recipients
+    if [[ -e "$storedir/$path/.keyids-reset" ]]; then
+      recipients_reset
+    fi
+
+    recipients_append "$path" || true
+  done
+} #}}}
+
+recipients_reset() { #{{{
+  unset recipients
+  if ! recipients_append ""; then
+    recipients=("${default_recipients[@]}")
+  fi
+} #}}}
+
+recipients_append() { #{{{
+  local passdir=$1
+  if [[ ! -v storedir ]]; then return 2; fi
+
+  # Add the recipients listed in the .keyids file to $recipients
+  if [[ ! -e "$storedir/$passdir/.keyids" ]]; then
+    return 1
+  fi
+
+  # Iterate over each line in .keyids
+  while read line; do
+    # Ignore comments
+    if [[ $line =~ ^[$' \t']*(#.*)?$ ]]; then
+      continue
+    fi
+    # If the line matches "match: id" then add id to recipients only if the
+    # full password name matches "match", which is treated as a glob which
+    # DOES NOT CONSIDER '/' SPECIAL (ie. *foo matches bar/baz-foo)
+    if [[ $line =~ ^[$' \t']*([^$' \t']):[$' \t']+ ]]; then
+      if [[ $passfile = ${BASH_REMATCH[1]} ]]; then # Treats $match as a glob
+	recipients+=(--recipient "${line#${BASH_REMATCH[0]}}")
+      fi
+    # Add all other lines to $recipients as-is
+    else
+      recipients+=(--recipient $line)
+    fi
+  done < "$storedir/$passdir/.keyids"
+} #}}}
+
+## }}}
+
+## External call functions {{{
+
+call_gpg() { #{{{
+  gpg --quiet --yes --batch --no-encrypt-to --no-default-recipient "$@"
+} #}}}
+
+call_editor() { #{{{
+  ${VISUAL:-${EDITOR:-vi}} "$@"
+} #}}}
+
+call_diff() { #{{{
+  diff -u "$@"
+} #}}}
+
+call_mktemp() { #{{{
+  if [[ ! -v tempdir \
+        || ! ( -d /dev/shm && -w /dev/shm && -x /dev/shm ) ]]; then
+    cat >&2 <<-'MESSAGE'
+	Your system does not have a usable /dev/shm, which means that it may be
+	difficult to entirely erase the temporary non-encrypted password file
+	after editing.
+MESSAGE
+    if [[ ! -v use_unsafe_tempdir ]]; then
+      read -r -p "Continue anyway, using global temporary directory? [y/N] " ask
+      if [[ ${ask,} != y ]]; then
+	return 1
+      fi
+    else
+      echo "Continuing because --use-unsafe-tempdir" >&2
+    fi
+    tempdir=${TMPDIR:-/tmp}
+  else
+    tempdir=/dev/shm
+  fi
+
+  tempfile=$(mktemp "$tempdir"/tmp.XXXXXXXXXX)
+  tempfiles+=("$tempfile")
+  if ! declare -f clean_tempfiles >/dev/null; then
+    clean_tempfiles() {
+      for file in "${tempfiles[@]}"; do
+	[[ -e "$file" ]] && call_destroy "$file"
+      done
+    }
+    trap clean_tempfiles EXIT
+  fi
+  if [[ $# -eq 1 ]]; then
+    eval "$1=\$tempfile"
+  fi
+} #}}}
+
+call_destroy() { #{{{
+  rm -f "$@"
+} #}}}
+
+rc_init() { #{{{
+  new_storedir=${1:-$storedir}
+  if [[ -e "$new_storedir/.git" ]]; then return 1; fi
+  pushd "$new_storedir" >/dev/null
+  git init >&2
+  popd >/dev/null
+} #}}}
+
+rc_add() { #{{{
+  if [[ ! -v storedir ]]; then return 2; fi
+  if [[ -v skip_git ]]; then return 0; fi
+  if [[ ! -e "$storedir/.git" ]]; then return 1; fi
+  pushd "$storedir" >/dev/null
+  git add "${@/#/./}" # Prepend ./ to each item
+  popd >/dev/null
+} #}}}
+
+rc_commit() { #{{{
+  if [[ ! -v storedir ]]; then return 2; fi
+  if [[ -v skip_git ]]; then return 0; fi
+  if [[ ! -e "$storedir/.git" ]]; then return 1; fi
+  pushd "$storedir" >/dev/null
+  git commit -m "$1"
+  popd >/dev/null
+} #}}}
+
+## }}}
+
+# }}}
+
+# {{{ Examine the command-line for options (which begin with a -) and arguments
+# (which don't). Process each option as it's encountered and append the
+# arguments to the array $arguments.
+
+unset short option arguments
+while [[ $# != 0 ]]; do # Iterate over each command-line argument
+  # Separate the current cli string into an option or an argument {{{
+  if [[ $1 =~ ^-- ]]; then
+    # long options (--foo) set options=foo
+    option=${1#--}
+    shift
+  elif [[ $1 =~ ^- ]]; then
+    # short options (-foo) set options=(f o o)
+    short=${1#-}
+    shift
+    option=()
+    for (( i=0; i<${#short}; i++ )); do
+      option+=("${short:$i:1}")
+    done
+  else
+    # non options (don't begin -) append to arguments and return
+    arguments+=("$1")
+    shift
+    continue
+  fi
+  #}}}
+
+  # Process options as they are encountered {{{
+  for o in "${option[@]}"; do
+    case "$o" in
+      h|help)
+	usage 0
+	;;
+      c|create)
+	edit_create=1
+	;;
+      e|echo)
+	echo_tty=1
+	;;
+      d|diff)
+	diff=1
+	;;
+      g|skip-git)
+	skip_git=1
+	;;
+      H|headings)
+	headings=1
+	;;
+      k|key)
+	key=$1
+	shift
+	default_recipients=(--recipient "$key")
+	;;
+      l|length)
+	# TODO: Match --length=xxx (and -lxxx?)
+	generate_length=$1
+	shift
+	;;
+      m|multiline)
+	multiline=1
+	;;
+      n|no-symbols)
+	unset generate_symbols
+	;;
+      o|once)
+	read_once=1
+	;;
+      O|overwrite)
+	overwrite=1
+	;;
+      r|recurse|recursive)
+	recursive=1
+	;;
+      R|reset-keyids)
+	reset_keyids=1
+	;;
+      s|store|store-directory)
+	storedir=$1
+	shift
+	;;
+      t|tempdir)
+	tempdir=$1
+	shift
+	;;
+      U|use-unsafe-tempdir)
+	use_unsafe_tempdir=1
+	;;
+    esac
+  done
+  # }}}
+done
+
+#}}}
+
+# If called as "pass-foo" set proc to foo, or shift the first argument. {{{
+
+bin=$(basename "$0")
+if [[ $bin =~ ^pass- ]]; then
+  proc=${bin#pass-}
+else
+  if [[ ${#arguments[@]} -eq 0 ]]; then
+    echo No procedure was specified. >&2
+    exit 1
+  fi
+  proc=${arguments[0]}
+  # shift $arguments
+  # Tries to read one past the end of the array, but that does no harm
+  arguments=("${arguments[@]:1:${#arguments[@]}}")
+fi
+if [[ $proc == list ]]; then proc=ls; fi
+
+# }}}
+
+# {{{ If the function another_pass_$proc exists, call it with the $arguments
+
+if declare -f "another_pass_$proc" >/dev/null; then
+  "another_pass_$proc" "${arguments[@]}"
+else
+  echo "$proc is not a valid pass command." >&2
+  exit 1
+fi
+
+# }}}
+
+# vim: set ft=sh fdm=marker:
